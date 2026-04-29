@@ -246,7 +246,6 @@ def _run_listener(host: str, port: int, handler) -> None:
             conn, addr = srv.accept()
             threading.Thread(target=handler, args=(conn, addr), daemon=True).start()
 
-
 def run_server(host: str = HOST, smtp_port: int = SMTP_PORT, pop3_port: int = POP3_PORT, imap_port: int = IMAP_PORT) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

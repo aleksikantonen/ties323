@@ -10,7 +10,6 @@ def _send(sock: socket.socket, line: str) -> None:
     print(f"c->s {line}")
     sock.sendall((line + "\r\n").encode("utf-8"))
 
-
 def _read(sock: socket.socket) -> str:
     buf = b""
     while True:
@@ -25,7 +24,6 @@ def _read(sock: socket.socket) -> str:
         if len(buf) > 8192:
             raise RuntimeError("server sent an oversized response line")
 
-
 def _command(sock: socket.socket, cmd: str, counter: list) -> list[str]:
     counter[0] += 1
     tag = f"A{counter[0]:03d}"
@@ -38,7 +36,6 @@ def _command(sock: socket.socket, cmd: str, counter: list) -> list[str]:
             if f"{tag} OK" not in line:
                 raise RuntimeError(f"command failed: {line}")
             return lines
-
 
 def imap_session(
     host: str,
