@@ -202,6 +202,11 @@ def handle_imap_session(conn: socket.socket, addr: tuple) -> None:
                 # no password checking
                 _send(conn, f"{tag} OK LOGIN completed")
 
+            elif verb == "LIST":
+                for i, path in enumerate(messages, start=1):
+                    _send(conn, f"* {i} ({os.path.getsize(path)} bytes)")
+                _send(conn, f"{tag} OK {len(messages)} messages")
+
             elif verb == "SELECT":
                 _send(conn, f"* {len(messages)} EXISTS")
                 _send(conn, f"{tag} OK SELECT completed")
