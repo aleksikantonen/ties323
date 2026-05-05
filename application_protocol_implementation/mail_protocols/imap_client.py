@@ -5,69 +5,56 @@ import argparse
 
 MAILBOX_DIR = os.path.join(os.path.dirname(__file__), "mailbox")
 
-
-def _send(sock: socket.socket, line: str) -> None:
+def send_line(sock, line):
     print(f"c->s {line}")
-    sock.sendall((line + "\r\n").encode("utf-8"))
+    sock.sendall((line + "\r\n").encode())
 
-def _read(sock: socket.socket) -> str:
+def recv_line(sock):
     buf = b""
     while True:
         ch = sock.recv(1)
         if not ch:
-            raise ConnectionError("server closed the connection")
+            raise ConnectionError("server closed")
         buf += ch
         if buf.endswith(b"\n"):
-            line = buf.rstrip(b"\r\n").decode("utf-8", errors="replace")
+            line = buf.rstrip(b"\r\n").decode(errors="replace")
             print(f"s->c {line}")
             return line
-        if len(buf) > 8192:
-            raise RuntimeError("server sent an oversized response line")
 
-def _command(sock: socket.socket, cmd: str, counter: list) -> list[str]:
-    counter[0] += 1
-    tag = f"A{counter[0]:03d}"
-    _send(sock, f"{tag} {cmd}")
+def send_command(sock, cmd, tag):
+    # imap commands are prefixed with a unique tag so responses can be matched
+    send_line(sock, f"{tag} {cmd}")
     lines = []
     while True:
-        line = _read(sock)
+        line = recv_line(sock)
         lines.append(line)
+        # server echoes the tag back on the final response line
         if line.startswith(tag):
             if f"{tag} OK" not in line:
                 raise RuntimeError(f"command failed: {line}")
             return lines
 
-def imap_session(
-    host: str,
-    port: int,
-    username: str,
-    password: str,
-    use_ssl: bool,
-    fetch: bool,
-) -> None:
+def imap_session(host, port, username, password, use_ssl, fetch):
     print(f"\nconnecting to {host}:{port}...")
 
     raw_sock = socket.create_connection((host, port))
-
     if use_ssl:
-        context = ssl.create_default_context()
-        sock = context.wrap_socket(raw_sock, server_hostname=host)
+        sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host)
     else:
         sock = raw_sock
 
     with sock:
-        # greeting
-        _read(sock)
+        recv_line(sock)
 
-        counter = [0]
+        seq = 0
 
-        # LOGIN
-        _command(sock, f"LOGIN {username} {password}", counter)
+        seq += 1
+        send_command(sock, f"LOGIN {username} {password}", f"A{seq:03d}")
 
-        # SELECT INBOX
-        lines = _command(sock, "SELECT INBOX", counter)
+        # SELECT tells us how many messages are in the mailbox
+        seq += 1
+        lines = send_command(sock, "SELECT INBOX", f"A{seq:03d}")
 
-        # find message count from "* N EXISTS"
         count = 0
         for line in lines:
             if line.startswith("*") and "EXISTS" in line:
@@ -76,43 +63,31 @@ def imap_session(
 
         print(f"\n{count} message(s) in INBOX")
 
-        if count == 0:
-            _command(sock, "LOGOUT", counter)
-            print("\ndone.")
-            return
-
-        if fetch:
+        if fetch and count > 0:
             os.makedirs(MAILBOX_DIR, exist_ok=True)
             for n in range(1, count + 1):
-                print(f"\n  fetching message {n} ...")
-                lines = _command(sock, f"FETCH {n} RFC822", counter)
+                print(f"\n  fetching message {n}...")
+                seq += 1
+                lines = send_command(sock, f"FETCH {n} RFC822", f"A{seq:03d}")
+                # response lines: [fetch header, ...body lines..., closing paren, tagged ok]
                 body_lines = lines[1:-2]
                 path = os.path.join(MAILBOX_DIR, f"imap_msg_{n}.eml")
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write("\r\n".join(body_lines) + "\r\n")
+                with open(path, "w") as f:
+                    f.write("\r\n".join(body_lines) + "\r\n")
                 print(f"  saved to {path}")
 
-        # LOGOUT
-        _command(sock, "LOGOUT", counter)
+        seq += 1
+        send_command(sock, "LOGOUT", f"A{seq:03d}")
 
     print("\ndone.")
 
-
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="imap client")
-    p.add_argument("--host",   required=True,           help="imap server hostname")
-    p.add_argument("--port",   required=True, type=int, help="imap server port")
-    p.add_argument("--user",   required=True,           help="username / email address")
-    p.add_argument("--pass",   required=True,           help="password or app password", dest="password")
-    p.add_argument("--no-ssl", action="store_true",     help="connect without tls")
-    p.add_argument("--fetch",  action="store_true",     help="download all messages to ./mailbox/")
+    p = argparse.ArgumentParser(description="simple imap client")
+    p.add_argument("--host",   required=True)
+    p.add_argument("--port",   required=True, type=int)
+    p.add_argument("--user",   required=True)
+    p.add_argument("--pass",   required=True, dest="password")
+    p.add_argument("--no-ssl", action="store_true", help="connect without tls")
+    p.add_argument("--fetch",  action="store_true", help="download messages to ./mailbox/")
     args = p.parse_args()
-
-    imap_session(
-        host=args.host,
-        port=args.port,
-        username=args.user,
-        password=args.password,
-        use_ssl=not args.no_ssl,
-        fetch=args.fetch,
-    )
+    imap_session(args.host, args.port, args.user, args.password, not args.no_ssl, args.fetch)

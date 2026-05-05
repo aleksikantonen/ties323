@@ -5,74 +5,62 @@ import argparse
 
 MAILBOX_DIR = os.path.join(os.path.dirname(__file__), "mailbox")
 
-
-def _send(sock: socket.socket, line: str) -> None:
+def send_line(sock, line):
     print(f"c->s {line}")
-    sock.sendall((line + "\r\n").encode("utf-8"))
+    sock.sendall((line + "\r\n").encode())
 
-def _read(sock: socket.socket) -> str:
+def recv_line(sock):
     buf = b""
     while True:
         ch = sock.recv(1)
         if not ch:
-            raise ConnectionError("server closed the connection")
+            raise ConnectionError("server closed")
         buf += ch
         if buf.endswith(b"\n"):
-            line = buf.rstrip(b"\r\n").decode("utf-8", errors="replace")
+            line = buf.rstrip(b"\r\n").decode(errors="replace")
             print(f"s->c {line}")
             return line
-        if len(buf) > 1000:
-            raise RuntimeError("server sent an oversized response line")
 
-def _read_ok(sock: socket.socket) -> str:
-    line = _read(sock)
+def recv_ok(sock):
+    # pop3 positive responses start with +OK
+    line = recv_line(sock)
     if not line.startswith("+OK"):
         raise RuntimeError(f"server error: {line}")
     return line
 
-def _read_multiline(sock: socket.socket) -> list[str]:
+def recv_multiline(sock):
+    # pop3 multi-line responses end with a line containing only "."
+    # lines starting with ".." are dot-unstuffed to "."
     lines = []
     while True:
-        line = _read(sock)
+        line = recv_line(sock)
         if line == ".":
             break
         lines.append(line[1:] if line.startswith("..") else line)
     return lines
 
-def pop3_session(
-    host: str,
-    port: int,
-    username: str,
-    password: str,
-    use_ssl: bool,
-    fetch: bool,
-) -> None:
+def pop3_session(host, port, username, password, use_ssl, fetch):
     print(f"\nconnecting to {host}:{port}...")
 
     raw_sock = socket.create_connection((host, port))
-
     if use_ssl:
-        context = ssl.create_default_context()
-        sock = context.wrap_socket(raw_sock, server_hostname=host)
+        sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host)
     else:
         sock = raw_sock
 
     with sock:
-        # greeting
-        _read_ok(sock)
+        recv_ok(sock)                           # server greeting
 
-        # USER
-        _send(sock, f"USER {username}")
-        _read_ok(sock)
+        send_line(sock, f"USER {username}")
+        recv_ok(sock)
 
-        # PASS
-        _send(sock, f"PASS {password}")
-        _read_ok(sock)
+        send_line(sock, f"PASS {password}")
+        recv_ok(sock)
 
-        # LIST
-        _send(sock, "LIST")
-        _read_ok(sock)
-        entries = _read_multiline(sock)
+        # LIST returns one line per message: "<num> <size>"
+        send_line(sock, "LIST")
+        recv_ok(sock)
+        entries = recv_multiline(sock)
 
         if not entries:
             print("mailbox is empty")
@@ -84,37 +72,27 @@ def pop3_session(
             os.makedirs(MAILBOX_DIR, exist_ok=True)
             for entry in entries:
                 msg_num = entry.split()[0]
-                print(f"\n  fetching message {msg_num} ...")
-                _send(sock, f"RETR {msg_num}")
-                _read_ok(sock)
-                msg_lines = _read_multiline(sock)
+                print(f"\n  fetching message {msg_num}...")
+                send_line(sock, f"RETR {msg_num}")
+                recv_ok(sock)
+                msg_lines = recv_multiline(sock)
                 path = os.path.join(MAILBOX_DIR, f"pop3_msg_{msg_num}.eml")
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write("\r\n".join(msg_lines) + "\r\n")
+                with open(path, "w") as f:
+                    f.write("\r\n".join(msg_lines) + "\r\n")
                 print(f"  saved to {path}")
 
-        # QUIT
-        _send(sock, "QUIT")
-        _read(sock)
+        send_line(sock, "QUIT")
+        recv_line(sock)
 
     print("\ndone.")
 
-
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="pop3 client")
-    p.add_argument("--host",   required=True,           help="pop3 server hostname")
-    p.add_argument("--port",   required=True, type=int, help="pop3 server port")
-    p.add_argument("--user",   required=True,           help="mailbox username / email address")
-    p.add_argument("--pass",   required=True,           help="password or app password", dest="password")
-    p.add_argument("--no-ssl", action="store_true",     help="connect without tls")
-    p.add_argument("--fetch",  action="store_true",     help="download all messages to ./mailbox/")
+    p = argparse.ArgumentParser(description="simple pop3 client")
+    p.add_argument("--host",   required=True)
+    p.add_argument("--port",   required=True, type=int)
+    p.add_argument("--user",   required=True)
+    p.add_argument("--pass",   required=True, dest="password")
+    p.add_argument("--no-ssl", action="store_true", help="connect without tls")
+    p.add_argument("--fetch",  action="store_true", help="download messages to ./mailbox/")
     args = p.parse_args()
-
-    pop3_session(
-        host=args.host,
-        port=args.port,
-        username=args.user,
-        password=args.password,
-        use_ssl=not args.no_ssl,
-        fetch=args.fetch,
-    )
+    pop3_session(args.host, args.port, args.user, args.password, not args.no_ssl, args.fetch)

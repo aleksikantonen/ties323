@@ -9,8 +9,7 @@ POP3_PORT = 1100
 IMAP_PORT = 1430
 MAILBOX_DIR = os.path.join(os.path.dirname(__file__), "mailbox")
 
-
-def _read(conn: socket.socket) -> str | None:
+def read_line(conn):
     buf = b""
     while True:
         try:
@@ -21,32 +20,30 @@ def _read(conn: socket.socket) -> str | None:
             return None
         buf += ch
         if buf.endswith(b"\n"):
-            return buf.rstrip(b"\r\n").decode("utf-8", errors="replace")
-        if len(buf) > 1000:  # rfc 5321 line-length limit
-            return None
+            return buf.rstrip(b"\r\n").decode(errors="replace")
 
-def _send(conn: socket.socket, line: str) -> None:
+def send_line(conn, line):
     print(f"s->c {line}")
-    conn.sendall((line + "\r\n").encode("utf-8"))
+    conn.sendall((line + "\r\n").encode())
 
-def _extract_address(argument: str) -> str | None:
-    if "<" in argument and ">" in argument:
-        return argument[argument.index("<") + 1 : argument.index(">")].strip()
-    return argument.strip() or None
+def extract_address(arg):
+    # pull address from MAIL FROM:<addr> or RCPT TO:<addr>
+    if "<" in arg and ">" in arg:
+        return arg[arg.index("<") + 1:arg.index(">")].strip()
+    return arg.strip() or None
 
-def _save_message(sender: str, recipients: list[str], lines: list[str]) -> str:
+def save_message(sender, recipients, lines):
     os.makedirs(MAILBOX_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = os.path.join(MAILBOX_DIR, f"msg_{stamp}.eml")
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(f"X-Envelope-From: {sender}\r\n")
+    with open(path, "w") as f:
+        f.write(f"X-Envelope-From: {sender}\r\n")
         for r in recipients:
-            fh.write(f"X-Envelope-To: {r}\r\n")
-        fh.write("\r\n".join(lines) + "\r\n")
+            f.write(f"X-Envelope-To: {r}\r\n")
+        f.write("\r\n".join(lines) + "\r\n")
     return path
 
-
-def _load_messages() -> list[str]:
+def load_messages():
     os.makedirs(MAILBOX_DIR, exist_ok=True)
     return sorted(
         os.path.join(MAILBOX_DIR, f)
@@ -54,143 +51,128 @@ def _load_messages() -> list[str]:
         if f.endswith(".eml")
     )
 
-def handle_session(conn: socket.socket) -> None:
+def handle_smtp_session(conn, addr):
+    # smtp is a stateful protocol: commands must arrive in a specific order
     state = "WAIT_HELO"
     sender = ""
-    recipients: list[str] = []
-    data: list[str] = []
+    recipients = []
+    data = []
 
-    _send(conn, f"220 {socket.gethostname()} smtp server ready")
+    send_line(conn, f"220 {socket.gethostname()} smtp server ready")
 
     try:
         while True:
-            line = _read(conn)
+            line = read_line(conn)
             if line is None:
                 break
 
+            # while in DATA state, collect lines until the end-of-data marker "."
             if state == "READING_DATA":
-                if line == ".":  # end-of-message
-                    path = _save_message(sender, recipients, data)
+                if line == ".":
+                    path = save_message(sender, recipients, data)
                     print(f"saved {path}")
                     sender, recipients, data = "", [], []
                     state = "WAIT_MAIL"
-                    _send(conn, "250 Ok: message queued")
+                    send_line(conn, "250 Ok: message queued")
                 else:
                     data.append(line)
                 continue
 
-            print(line)
+            print(f"c->s {line}")
             parts = line.split(" ", 1)
             verb = parts[0].upper()
             arg = parts[1] if len(parts) > 1 else ""
 
             if verb == "HELO":
-                if not arg:
-                    _send(conn, "501 Syntax: HELO hostname")
-                else:
-                    state = "WAIT_MAIL"
-                    _send(conn, f"250 Hello {arg}")
-
+                state = "WAIT_MAIL"
+                send_line(conn, f"250 Hello {arg}")
             elif verb == "MAIL" and state == "WAIT_MAIL":
-                addr_str = _extract_address(arg)
+                addr_str = extract_address(arg)
                 if addr_str is None:
-                    _send(conn, "501 Syntax: MAIL FROM:<address>")
+                    send_line(conn, "501 Syntax: MAIL FROM:<address>")
                 else:
                     sender = addr_str
                     state = "WAIT_RCPT"
-                    _send(conn, "250 Ok")
-
+                    send_line(conn, "250 Ok")
             elif verb == "RCPT" and state in ("WAIT_RCPT", "DATA_READY"):
-                addr_str = _extract_address(arg)
+                addr_str = extract_address(arg)
                 if addr_str is None:
-                    _send(conn, "501 Syntax: RCPT TO:<address>")
+                    send_line(conn, "501 Syntax: RCPT TO:<address>")
                 else:
                     recipients.append(addr_str)
                     state = "DATA_READY"
-                    _send(conn, "250 Ok")
-
+                    send_line(conn, "250 Ok")
             elif verb == "DATA" and state == "DATA_READY":
                 state = "READING_DATA"
-                _send(conn, "354 End data with <CR><LF>.<CR><LF>")
-
+                send_line(conn, "354 End data with <CR><LF>.<CR><LF>")
             elif verb == "QUIT":
-                _send(conn, f"221 {socket.gethostname()} closing connection")
+                send_line(conn, f"221 {socket.gethostname()} closing connection")
                 break
-
             else:
-                _send(conn, "503 Bad sequence of commands")
+                send_line(conn, "503 Bad sequence of commands")
     finally:
         conn.close()
-        print("server closed connection")
 
-def handle_pop3_session(conn: socket.socket, addr: tuple) -> None:
-    messages = _load_messages()
-
-    print(f"[+] pop3 {addr}  ({len(messages)} messages)")
-    _send(conn, "+OK simple pop3 server ready")
+def handle_pop3_session(conn, addr):
+    messages = load_messages()
+    print(f"pop3 connection from {addr} ({len(messages)} messages)")
+    send_line(conn, "+OK simple pop3 server ready")
 
     try:
         while True:
-            line = _read(conn)
+            line = read_line(conn)
             if line is None:
                 break
 
-            print(f"pop3 c->s {line}")
+            print(f"c->s {line}")
             parts = line.split(" ", 1)
             verb = parts[0].upper()
             arg = parts[1].strip() if len(parts) > 1 else ""
 
             if verb == "USER":
-                _send(conn, "+OK")
-
+                send_line(conn, "+OK")
             elif verb == "PASS":
-                # no password checking per task description
-                _send(conn, f"+OK {len(messages)} messages")
-
+                send_line(conn, f"+OK {len(messages)} messages")
             elif verb == "LIST":
-                _send(conn, f"+OK {len(messages)} messages")
+                send_line(conn, f"+OK {len(messages)} messages")
                 for i, path in enumerate(messages, start=1):
-                    conn.sendall(f"{i} {os.path.getsize(path)}\r\n".encode("utf-8"))
+                    conn.sendall(f"{i} {os.path.getsize(path)}\r\n".encode())
                 conn.sendall(b".\r\n")
-
             elif verb == "RETR":
                 try:
                     path = messages[int(arg) - 1]
                 except (ValueError, IndexError):
-                    _send(conn, "-ERR no such message")
+                    send_line(conn, "-ERR no such message")
                     continue
-                _send(conn, "+OK message follows")
-                with open(path, "r", encoding="utf-8") as fh:
-                    for msg_line in fh:
+                send_line(conn, "+OK message follows")
+                with open(path, "r") as f:
+                    for msg_line in f:
                         msg_line = msg_line.rstrip("\r\n")
+                        # dot-stuffing for lines that start with "."
                         if msg_line.startswith("."):
                             msg_line = "." + msg_line
-                        conn.sendall((msg_line + "\r\n").encode("utf-8"))
+                        conn.sendall((msg_line + "\r\n").encode())
                 conn.sendall(b".\r\n")
-
             elif verb == "QUIT":
-                _send(conn, "+OK bye")
+                send_line(conn, "+OK bye")
                 break
-
             else:
-                _send(conn, "-ERR unknown command")
+                send_line(conn, "-ERR unknown command")
     finally:
         conn.close()
-        print(f"[-] pop3 {addr}")
 
-def handle_imap_session(conn: socket.socket, addr: tuple) -> None:
-    messages = _load_messages()
-
-    print(f"[+] imap {addr}  ({len(messages)} messages)")
-    _send(conn, "* OK simple imap server ready")
+def handle_imap_session(conn, addr):
+    messages = load_messages()
+    print(f"imap connection from {addr} ({len(messages)} messages)")
+    send_line(conn, "* OK simple imap server ready")
 
     try:
         while True:
-            line = _read(conn)
+            line = read_line(conn)
             if line is None:
                 break
 
-            print(f"imap c->s {line}")
+            print(f"c->s {line}")
             parts = line.split(" ", 2)
             if len(parts) < 2:
                 continue
@@ -199,45 +181,34 @@ def handle_imap_session(conn: socket.socket, addr: tuple) -> None:
             arg = parts[2].strip() if len(parts) > 2 else ""
 
             if verb == "LOGIN":
-                # no password checking
-                _send(conn, f"{tag} OK LOGIN completed")
-
-            elif verb == "LIST":
-                for i, path in enumerate(messages, start=1):
-                    _send(conn, f"* {i} ({os.path.getsize(path)} bytes)")
-                _send(conn, f"{tag} OK {len(messages)} messages")
-
+                send_line(conn, f"{tag} OK LOGIN completed")
             elif verb == "SELECT":
-                _send(conn, f"* {len(messages)} EXISTS")
-                _send(conn, f"{tag} OK SELECT completed")
-
+                # EXISTS tells the client how many messages are in the mailbox
+                send_line(conn, f"* {len(messages)} EXISTS")
+                send_line(conn, f"{tag} OK SELECT completed")
             elif verb == "FETCH":
-                fetch_parts = arg.split()
                 try:
-                    n = int(fetch_parts[0])
+                    n = int(arg.split()[0])
                     path = messages[n - 1]
                 except (ValueError, IndexError):
-                    _send(conn, f"{tag} NO no such message")
+                    send_line(conn, f"{tag} NO no such message")
                     continue
-                with open(path, "r", encoding="utf-8") as fh:
-                    body = fh.read()
-                _send(conn, f"* {n} FETCH (RFC822 {{{len(body.encode())}}}")
-                conn.sendall(body.encode("utf-8"))
+                with open(path, "r") as f:
+                    body = f.read()
+                send_line(conn, f"* {n} FETCH (RFC822 {{{len(body.encode())}}}")
+                conn.sendall(body.encode())
                 conn.sendall(b")\r\n")
-                _send(conn, f"{tag} OK FETCH completed")
-
+                send_line(conn, f"{tag} OK FETCH completed")
             elif verb == "LOGOUT":
-                _send(conn, "* BYE logging out")
-                _send(conn, f"{tag} OK LOGOUT completed")
+                send_line(conn, "* BYE logging out")
+                send_line(conn, f"{tag} OK LOGOUT completed")
                 break
-
             else:
-                _send(conn, f"{tag} BAD unknown command")
+                send_line(conn, f"{tag} BAD unknown command")
     finally:
         conn.close()
-        print(f"[-] imap {addr}")
 
-def _run_listener(host: str, port: int, handler) -> None:
+def run_listener(host, port, handler):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((host, port))
@@ -246,15 +217,15 @@ def _run_listener(host: str, port: int, handler) -> None:
             conn, addr = srv.accept()
             threading.Thread(target=handler, args=(conn, addr), daemon=True).start()
 
-def run_server(host: str = HOST, smtp_port: int = SMTP_PORT, pop3_port: int = POP3_PORT, imap_port: int = IMAP_PORT) -> None:
+def run_server():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((host, smtp_port))
+        srv.bind((HOST, SMTP_PORT))
         srv.listen(5)
-        print(f"smtp on {host}:{smtp_port}  pop3 on {host}:{pop3_port}  imap on {host}:{imap_port}")
+        print(f"smtp on {HOST}:{SMTP_PORT}  pop3 on {HOST}:{POP3_PORT}  imap on {HOST}:{IMAP_PORT}")
         print(f"mailbox: {MAILBOX_DIR}")
-        threading.Thread(target=_run_listener, args=(host, pop3_port, handle_pop3_session), daemon=True).start()
-        threading.Thread(target=_run_listener, args=(host, imap_port, handle_imap_session), daemon=True).start()
+        threading.Thread(target=run_listener, args=(HOST, POP3_PORT, handle_pop3_session), daemon=True).start()
+        threading.Thread(target=run_listener, args=(HOST, IMAP_PORT, handle_imap_session), daemon=True).start()
         print("press ctrl+c to stop\n")
         while True:
             try:
@@ -262,8 +233,7 @@ def run_server(host: str = HOST, smtp_port: int = SMTP_PORT, pop3_port: int = PO
             except KeyboardInterrupt:
                 print("\nshutting down...")
                 break
-            threading.Thread(target=handle_session, args=(conn,), daemon=True).start()
-
+            threading.Thread(target=handle_smtp_session, args=(conn, addr), daemon=True).start()
 
 if __name__ == "__main__":
     run_server()
